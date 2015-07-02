@@ -15,7 +15,7 @@
 __author__ = "Mariano Reingart (reingart@gmail.com)"
 __copyright__ = "Copyright (C) 2010-2014 Mariano Reingart"
 __license__ = "GPL 3.0"
-__version__ = "1.33d"
+__version__ = "1.33j"
 
 import datetime
 import os
@@ -149,7 +149,7 @@ def autorizar(ws, entrada, salida, informar_caea=False):
     elif '/json' in sys.argv:
         import json
         encabezado = json.load(entrada)[0]
-        ivas = encabezado.get('ivas', [])
+        ivas = encabezado.get('ivas', encabezado.get('iva', []))
         tributos = encabezado.get('tributos', [])
         cbtasocs = encabezado.get('cbtasocs', [])
         opcionales = encabezado.get('opcionales', [])
@@ -180,6 +180,15 @@ def autorizar(ws, entrada, salida, informar_caea=False):
     if not encabezado:
         raise RuntimeError("No se pudieron leer los registros de la entrada")
 
+    # ajusto datos para pruebas en depuración (nro de cbte. / fecha)
+    if '--testing' in sys.argv and DEBUG:
+        encabezado['punto_vta'] = 9998
+        cbte_nro = int(ws.CompUltimoAutorizado(encabezado['tipo_cbte'], 
+                                               encabezado['punto_vta'])) + 1
+        encabezado['cbt_desde'] = cbte_nro
+        encabezado['cbt_hasta'] = cbte_nro
+        encabezado['fecha_cbte'] = datetime.datetime.now().strftime("%Y%m%d")
+
     ws.CrearFactura(**encabezado)
     for tributo in tributos:
         ws.AgregarTributo(**tributo)
@@ -192,7 +201,7 @@ def autorizar(ws, entrada, salida, informar_caea=False):
 
     if DEBUG:
         print '\n'.join(["%s='%s'" % (k,str(v)) for k,v in ws.factura.items()])
-    if not DEBUG or raw_input("Facturar?")=="S":
+    if not DEBUG or raw_input("Facturar (S/n)?")=="S":
         if not informar_caea:
             cae = ws.CAESolicitar()
             dic = ws.factura
@@ -203,7 +212,8 @@ def autorizar(ws, entrada, salida, informar_caea=False):
             TIPO_CBTE.get(dic['tipo_cbte'], dic['tipo_cbte']), 
             dic['punto_vta'], dic['cbt_desde'], dic['cbt_hasta'], 
             TIPO_DOC.get(dic['tipo_doc'], dic['tipo_doc']), dic['nro_doc'], 
-            dic['imp_total'], dic['imp_iva']) 
+            float(dic['imp_total']), 
+            float(dic['imp_iva'] if dic['imp_iva'] is not None else 'NaN')) 
         dic.update(encabezado)         # preservar la estructura leida
         dic.update({
             'cae': cae and str(cae) or '',
@@ -221,7 +231,11 @@ def autorizar(ws, entrada, salida, informar_caea=False):
 def escribir_factura(dic, archivo, agrega=False):
     if '/json' in sys.argv:
         import json
-        json.dump([dic], archivo, sort_keys=True, indent=4)
+        factura = dic.copy()
+        if 'iva' in factura:
+            factura['ivas'] = factura.get('iva', [])
+            del factura['iva']
+        json.dump([factura], archivo, sort_keys=True, indent=4)
     else:
         dic['tipo_reg'] = 0
         archivo.write(escribir(dic, ENCABEZADO))
@@ -229,8 +243,8 @@ def escribir_factura(dic, archivo, agrega=False):
             for it in dic['tributos']:
                 it['tipo_reg'] = 1
                 archivo.write(escribir(it, TRIBUTO))
-        if 'iva' in dic:
-            for it in dic['iva']:
+        if 'iva' in dic or 'ivas' in dic:
+            for it in dic.get('iva', dic.get('ivas')):
                 it['tipo_reg'] = 2
                 archivo.write(escribir(it, IVA))
         if 'cbtes_asoc' in dic:
@@ -365,14 +379,22 @@ if __name__ == "__main__":
                                  ('Tributo', TRIBUTO), ('Iva', IVA), 
                                  ('Comprobante Asociado', CMP_ASOC),
                                  ('Opcionales', OPCIONAL)]:
-                comienzo = 1
-                print "== %s ==" % msg
-                for fmt in formato:
-                    clave, longitud, tipo = fmt[0:3]
-                    dec = len(fmt)>3 and fmt[3] or (tipo=='I' and '2' or '')
-                    print " * Campo: %-20s Posición: %3d Longitud: %4d Tipo: %s Decimales: %s" % (
-                        clave, comienzo, longitud, tipo, dec)
-                    comienzo += longitud
+                if not '/dbf' in sys.argv:
+                    comienzo = 1
+                    print "== %s ==" % msg
+                    for fmt in formato:
+                        clave, longitud, tipo = fmt[0:3]
+                        dec = len(fmt)>3 and fmt[3] or (tipo=='I' and '2' or '')
+                        print " * Campo: %-20s Posición: %3d Longitud: %4d Tipo: %s Decimales: %s" % (
+                            clave, comienzo, longitud, tipo, dec)
+                        comienzo += longitud
+                else:
+                    from formatos.formato_dbf import definir_campos
+                    filename =  "%s.dbf" % msg.lower()[:8]
+                    print "==== %s (%s) ====" % (msg, filename)
+                    claves, campos = definir_campos(formato)
+                    for campo in campos:
+                        print " * Campo: %s" % (campo,)
             sys.exit(0)
 
         # obteniendo el TA
@@ -415,12 +437,19 @@ if __name__ == "__main__":
             
             if '--proyectos' in sys.argv:
                 ws.AgregarOpcional(2, "1234")  # identificador del proyecto
-                     # datos opcionales para RG 3668 Impuesto al Valor Agregado - Art.12:
+            
+            # datos opcionales para RG 3668 Impuesto al Valor Agregado - Art.12:
             if '--rg3668' in sys.argv:
                 ws.AgregarOpcional(5, "02")             # IVA Excepciones
                 ws.AgregarOpcional(61, "80")            # Firmante Doc Tipo
                 ws.AgregarOpcional(62, "20267565393")   # Firmante Doc Nro
                 ws.AgregarOpcional(7, "01")             # Carácter del Firmante
+
+            # RG 3.368 Establecimientos de educación pública de gestión privada
+            if '--rg3749' in sys.argv:
+                ws.AgregarOpcional(10, "1")             # Actividad Comprendida
+                ws.AgregarOpcional(1011, "80")            # Tipo de Documento
+                ws.AgregarOpcional(1012, "20267565393")   # Número de Documento
                 
             tributo_id = 99
             desc = 'Impuesto Municipal Matanza'

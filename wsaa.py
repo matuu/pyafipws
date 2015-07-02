@@ -19,16 +19,22 @@
 __author__ = "Mariano Reingart (reingart@gmail.com)"
 __copyright__ = "Copyright (C) 2008-2011 Mariano Reingart"
 __license__ = "GPL 3.0"
-__version__ = "2.09a"
+__version__ = "2.10e"
 
-import hashlib, datetime, email, os, sys, time, traceback
+import hashlib, datetime, email, os, sys, time, traceback, warnings
+import unicodedata
 from php import date
 from pysimplesoap.client import SimpleXMLElement
-from utils import inicializar_y_capturar_excepciones, BaseWS, get_install_dir
+from utils import inicializar_y_capturar_excepciones, BaseWS, get_install_dir, \
+     exception_info, safe_console
 try:
     from M2Crypto import BIO, Rand, SMIME, SSL
 except ImportError:
+    ex = exception_info()
+    warnings.warn("No es posible importar M2Crypto (OpenSSL)")
+    warnings.warn(ex['msg'])            # revisar instalación y DLLs de OpenSSL
     BIO = Rand = SMIME = SSL = None
+    # utilizar alternativa (ejecutar proceso por separado) 
     from subprocess import Popen, PIPE
     from base64 import b64encode
 
@@ -82,14 +88,17 @@ def sign_tra(tra,cert=CERT,privatekey=PRIVATEKEY,passphrase=""):
         # soporte de contraseña de encriptación (clave privada, opcional)
         callback = lambda *args, **kwarg: passphrase
         # Cargar clave privada y certificado
-        if privatekey.startswith("-----BEGIN RSA PRIVATE KEY-----"):
-            key_bio = BIO.MemoryBuffer(privatekey)
-            crt_bio = BIO.MemoryBuffer(cert)
-            s.load_key_bio(key_bio, crt_bio, callback)  # (desde buffer)
-        elif os.path.exists(privatekey) and os.path.exists(cert):
-            s.load_key(privatekey, cert, callback)      # (desde archivo)
-        else:
-            raise RuntimeError("Archivos no encontrados: %s, %s" % (privatekey, cert))
+        if not privatekey.startswith("-----BEGIN RSA PRIVATE KEY-----"):
+            # leer contenido desde archivo (evitar problemas Applink / MSVCRT)
+            if os.path.exists(privatekey) and os.path.exists(cert):
+                privatekey = open(privatekey).read()
+                cert = open(cert).read()
+            else:
+                raise RuntimeError("Archivos no encontrados: %s, %s" % (privatekey, cert))
+        # crear buffers en memoria de la clave privada y certificado:
+        key_bio = BIO.MemoryBuffer(privatekey)
+        crt_bio = BIO.MemoryBuffer(cert)
+        s.load_key_bio(key_bio, crt_bio, callback)  # (desde buffer)
         p7 = s.sign(buf,0)                      # Firmar el buffer
         out = BIO.MemoryBuffer()                # Crear un buffer para la salida 
         s.write(out, p7)                        # Generar p7 en formato mail
@@ -103,13 +112,18 @@ def sign_tra(tra,cert=CERT,privatekey=PRIVATEKEY,passphrase=""):
                 return part.get_payload(decode=False)   # devolver CMS
     else:
         # Firmar el texto (tra) usando OPENSSL directamente
-        out = Popen(["openssl", "smime", "-sign", 
-                     "-signer", cert, "-inkey", privatekey,
-                     "-outform","DER", "-nodetach"], 
-                    stdin=PIPE, stdout=PIPE, stderr=PIPE).communicate(tra)[0]
-        return b64encode(out)
+        try:
+            out = Popen(["openssl", "smime", "-sign", 
+                         "-signer", cert, "-inkey", privatekey,
+                         "-outform","DER", "-nodetach"], 
+                        stdin=PIPE, stdout=PIPE, stderr=PIPE).communicate(tra)[0]
+            return b64encode(out)
+        except Exception as e:
+            if e.errno == 2:
+                warnings.warn("El ejecutable de OpenSSL no esta disponible en el PATH")
+            raise
 
-                
+
 def call_wsaa(cms, location = WSAAURL, proxy=None, trace=False):
     "Llamar web service con CMS para obtener ticket de autorización (TA)"
 
@@ -131,6 +145,7 @@ class WSAA(BaseWS):
     _public_methods_ = ['CreateTRA', 'SignTRA', 'CallWSAA', 'LoginCMS', 'Conectar',
                         'AnalizarXml', 'ObtenerTagXml', 'Expirado', 'Autenticar',
                         'DebugLog', 'AnalizarCertificado',
+                        'CrearClavePrivada', 'CrearPedidoCertificado',
                         ]
     _public_attrs_ = ['Token', 'Sign', 'ExpirationTime', 'Version', 
                       'XmlRequest', 'XmlResponse', 
@@ -164,17 +179,70 @@ class WSAA(BaseWS):
         if binary:
             bio = BIO.MemoryBuffer(cert)
             x509 = X509.load_cert_bio(bio, X509.FORMAT_DER)
-        elif crt.startswith("-----BEGIN CERTIFICATE-----"):
+        else:
+            if not crt.startswith("-----BEGIN CERTIFICATE-----"):
+                crt = open(crt).read()
             bio = BIO.MemoryBuffer(crt)
             x509 = X509.load_cert_bio(bio, X509.FORMAT_PEM)
-        else:
-            x509 = X509.load_cert(crt, 1)
         if x509:
             self.Identidad = x509.get_subject().as_text()
             self.Caducidad = x509.get_not_after().get_datetime()
             self.Emisor = x509.get_issuer().as_text()
         return True
     
+    @inicializar_y_capturar_excepciones
+    def CrearClavePrivada(self, filename="privada.key", key_length=1024, 
+                                pub_exponent=0x10001, passphrase=""):
+        "Crea una clave privada (private key)"
+        from M2Crypto import RSA, EVP
+        
+        # only protect if passphrase was given (it will fail otherwise)
+        callback = lambda *args, **kwarg: passphrase
+        chiper = None if not passphrase else "aes_128_cbc"
+        # create the RSA key pair (and save the result to a file):
+        rsa_key_pair = RSA.gen_key(key_length, pub_exponent, callback)
+        bio = BIO.MemoryBuffer()
+        rsa_key_pair.save_key_bio(bio, chiper, callback)
+        f = open(filename, "w")
+        f.write(bio.read())
+        f.close()
+        # create a public key to sign the certificate request:
+        self.pkey = EVP.PKey(md='sha1')
+        self.pkey.assign_rsa(rsa_key_pair)
+
+    @inicializar_y_capturar_excepciones
+    def CrearPedidoCertificado(self, cuit="", empresa="", nombre="pyafipws",
+                                     filename="empresa.csr"):
+        "Crear un certificate signing request (X509 CSR)"
+        from M2Crypto import RSA, EVP, X509
+
+        # create the certificate signing request (CSR):
+        self.x509_req = X509.Request ()
+
+        # normalizar encoding (reemplazar acentos, eñe, etc.)
+        if isinstance(empresa, unicode):
+            empresa = unicodedata.normalize('NFKD', empresa).encode('ASCII')
+        if isinstance(nombre, unicode):
+            nombre = unicodedata.normalize('NFKD', nombre).encode('ASCII')
+
+        # subjet: C=AR/O=[empresa]/CN=[nombre]/serialNumber=CUIT [nro_cuit]
+        x509name = X509.X509_Name ()
+        # default OpenSSL parameters:
+        kwargs = {"type": 0x1000 | 1, "len": -1, "loc": -1, "set": 0}
+        x509name.add_entry_by_txt(field='C', entry='AR', **kwargs)
+        x509name.add_entry_by_txt(field='O', entry=empresa, **kwargs)
+        x509name.add_entry_by_txt(field='CN', entry=nombre, **kwargs)
+        x509name.add_entry_by_txt(field='serialNumber', entry="CUIT %s" % cuit, **kwargs)     
+        self.x509_req.set_subject_name(x509name)
+
+        # sign the request with the previously created key (CrearClavePrivada)
+        self.x509_req.set_pubkey (pkey=self.pkey)
+        self.x509_req.sign(pkey=self.pkey, md='sha256')
+        # save the CSR result to a file:
+        f = open(filename, "w")
+        f.write(self.x509_req.as_pem())
+        f.close()
+        
     @inicializar_y_capturar_excepciones
     def SignTRA(self, tra, cert, privatekey, passphrase=""):
         "Firmar el TRA y devolver CMS"
@@ -275,6 +343,8 @@ INSTALL_DIR = WSAA.InstallDir = get_install_dir()
 
 
 if __name__=="__main__":
+
+    safe_console()
     
     if '--register' in sys.argv or '--unregister' in sys.argv:
         import pythoncom
@@ -300,6 +370,42 @@ if __name__=="__main__":
         #win32com.server.localserver.main()
         # start the server.
         win32com.server.localserver.serve([WSAA._reg_clsid_])
+    elif "--crear_pedido_cert" in sys.argv:
+        # instanciar el helper y revisar los parámetros
+        wsaa = WSAA()
+        args = [arg for arg in sys.argv if not arg.startswith("--")]
+        # obtengo el CUIT y lo normalizo:
+        cuit = len(args)>1 and args[1] or raw_input("Ingrese un CUIT: ")
+        cuit = ''.join([c for c in cuit if c.isdigit()])
+        nombre = len(args)>2 and args[2] or "PyAfipWs"
+        # consultar el padrón online de AFIP si no se especificó razón social:
+        empresa = len(args)>3 and args[3] or ""
+        if not empresa:
+            from padron import PadronAFIP
+            padron = PadronAFIP()
+            ok = padron.Consultar(cuit)
+            if ok and padron.denominacion:
+                print u"Denominación según AFIP:", padron.denominacion
+                empresa = padron.denominacion
+            else:
+                print u"CUIT %s no encontrado: %s..." % (cuit, padron.Excepcion)
+                empresa = raw_input("Empresa: ")
+        # generar los archivos (con fecha para no pisarlo)
+        ts = datetime.datetime.now().strftime("%Y%m%d%M%S")
+        clave_privada = "clave_privada_%s_%s.key" % (cuit, ts)
+        pedido_cert = "pedido_cert_%s_%s.csr" % (cuit, ts)
+        wsaa.CrearClavePrivada(clave_privada)
+        wsaa.CrearPedidoCertificado(cuit, empresa, nombre, pedido_cert)
+        print "Se crearon los archivos:"
+        print clave_privada
+        print pedido_cert
+        # convertir a terminación de linea windows y abrir con bloc de notas
+        if sys.platform == "win32":
+            txt = open(pedido_cert + ".txt", "wb")
+            for linea in open(pedido_cert, "r"):
+                txt.write("%s\r\n" % linea)
+            txt.close()
+            os.startfile(pedido_cert + ".txt")
     else:
         
         # Leer argumentos desde la linea de comando (si no viene tomar default)
